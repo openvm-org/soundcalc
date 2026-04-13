@@ -40,12 +40,10 @@ class SWIRLWhirProximityMode:
         rho = 2.0 ** (-log_inv_rate)
         if self.kind == "unique":
             max_agreement = (1.0 + rho) / 2.0
-        elif self.kind == "list":
+        else:
             if self.m is None:
                 raise ValueError("list-decoding mode requires multiplicity m")
             max_agreement = math.sqrt(rho * (1.0 + 1.0 / self.m)) + 1e-6
-        else:
-            raise ValueError(f"Unknown SWIRL proximity mode: {self.kind}")
 
         max_agreement = max(max_agreement, math.ldexp(1.0, -1022))
         return -(num_queries * math.log2(max_agreement))
@@ -107,13 +105,12 @@ class SWIRLSystemParams:
 @dataclass(frozen=True)
 class SWIRLWhirDetails:
     mu_batching_bits: float
-    fold_rbr_bits: float
-    proximity_gaps_bits: float
-    sumcheck_bits: float
-    ood_rbr_bits: float
-    shift_rbr_bits: float
-    query_bits: float
-    gamma_batching_bits: float
+    pre_loop_proximity_gaps_bits: float
+    shared_whir_bits: float
+    shared_fold_bits: float | None
+    shared_ood_bits: float | None
+    shared_shift_bits: float | None
+    shared_final_bits: float | None
 
 
 @dataclass(frozen=True)
@@ -192,51 +189,72 @@ def _challenge_field_bits(field: FieldParams) -> float:
     return field.field_extension_degree * math.log2(field.p)
 
 
-def _log2_add(log2_x: float, log2_y: float) -> float:
-    hi, lo = (log2_x, log2_y) if log2_x >= log2_y else (log2_y, log2_x)
-    return hi + math.log2(1.0 + (2.0 ** (lo - hi)))
+def _finite_min(values: list[float]) -> float:
+    finite_values = [value for value in values if math.isfinite(value)]
+    if not finite_values:
+        return math.inf
+    return min(finite_values)
 
 
-def _combine_security_bits(bits_a: float, bits_b: float) -> float:
-    return -_log2_add(-bits_a, -bits_b)
+def _optional_bits(value: float) -> float | None:
+    if math.isfinite(value):
+        return value
+    return None
 
 
-def _n_logup_bound(
-    l_skip: int,
-    num_airs: int,
-    max_interactions_per_air: int,
-    max_log_height: int,
-    max_interaction_count: int,
-) -> int:
-    field_bound = math.ceil(math.log2(max_interaction_count)) - l_skip
-    param_bound = (
-        math.ceil(math.log2(num_airs))
-        + math.ceil(math.log2(max_interactions_per_air))
-        + max_log_height
-        - l_skip
+def _pre_main_loop_proximity_gaps_bits(
+    params: SWIRLSystemParams,
+    whir: WHIR,
+    regime: ProximityGapsRegime,
+) -> float:
+    min_bits = math.inf
+    for sub_round in range(params.whir.k):
+        rate, dimension = whir._get_code_for_iteration_and_round(0, sub_round + 1)
+        proximity_error = regime.get_error_powers(rate, dimension, 2)
+        proximity_bits = -math.log2(proximity_error) + params.whir.folding_pow_bits
+        min_bits = min(min_bits, proximity_bits)
+    return min_bits
+
+
+def _get_shared_whir_details(whir: WHIR, regime: ProximityGapsRegime) -> SWIRLWhirDetails:
+    levels = whir.get_pcs_security_levels(regime)
+
+    shared_fold_bits = math.inf
+    shared_ood_bits = math.inf
+    shared_shift_bits = math.inf
+    shared_final_bits = math.inf
+
+    for label, bits in levels.items():
+        bits = float(bits)
+        if label == "batching":
+            continue
+        if label.startswith("fold(i=0,"):
+            continue
+        if label.startswith("fold(i="):
+            shared_fold_bits = min(shared_fold_bits, bits)
+        elif label.startswith("OOD("):
+            shared_ood_bits = min(shared_ood_bits, bits)
+        elif label.startswith("Shift("):
+            shared_shift_bits = min(shared_shift_bits, bits)
+        elif label == "fin":
+            shared_final_bits = bits
+
+    shared_whir_bits = _finite_min([
+        shared_fold_bits,
+        shared_ood_bits,
+        shared_shift_bits,
+        shared_final_bits,
+    ])
+
+    return SWIRLWhirDetails(
+        mu_batching_bits=math.inf,
+        pre_loop_proximity_gaps_bits=math.inf,
+        shared_whir_bits=shared_whir_bits,
+        shared_fold_bits=_optional_bits(shared_fold_bits),
+        shared_ood_bits=_optional_bits(shared_ood_bits),
+        shared_shift_bits=_optional_bits(shared_shift_bits),
+        shared_final_bits=_optional_bits(shared_final_bits),
     )
-    return min(field_bound, param_bound)
-
-
-def _whir_sumcheck_security(challenge_field_bits: float, sub_round: int, folding_pow_bits: int) -> float:
-    sumcheck_degree = 2.0 if sub_round == 0 else 3.0
-    return challenge_field_bits - math.log2(sumcheck_degree) + folding_pow_bits
-
-
-def _whir_gamma_batching_security(
-    challenge_field_bits: float,
-    batch_size: int,
-    list_size: float,
-) -> float:
-    return challenge_field_bits - math.log2(batch_size) - math.log2(list_size)
-
-
-def _whir_ood_security(
-    challenge_field_bits: float,
-    log_degree_at_round_start: int,
-    list_size: float,
-) -> float:
-    return challenge_field_bits - log_degree_at_round_start + 1.0 - 2.0 * math.log2(list_size)
 
 
 def build_swirl_system_params(
@@ -294,17 +312,13 @@ def calculate_swirl_soundness(
     num_trace_columns: int,
     max_interactions_per_air: int,
 ) -> SWIRLSoundnessResult:
-    challenge_field_bits = _challenge_field_bits(field)
-    n_logup = _n_logup_bound(
-        params.l_skip,
-        num_airs,
-        max_interactions_per_air,
-        max_log_trace_height,
-        params.logup.max_interaction_count,
-    )
+    del max_interactions_per_air
 
+    challenge_field_bits = _challenge_field_bits(field)
     regime = params.whir.proximity.build_regime(field)
+
     mu_batching_bits = -math.log2(whir._get_batching_error(regime))
+    pre_loop_proximity_gaps_bits = _pre_main_loop_proximity_gaps_bits(params, whir, regime)
     initial_list_size = whir._get_list_size_for_iteration_and_round(0, 0, regime)
     log2_list_size = math.log2(initial_list_size)
 
@@ -338,77 +352,22 @@ def calculate_swirl_soundness(
         stacked_multilinear_bits,
     )
 
-    min_query_bits = math.inf
-    min_proximity_gaps_bits = math.inf
-    min_sumcheck_bits = math.inf
-    min_ood_bits = math.inf
-    min_gamma_batching_bits = math.inf
-    min_fold_rbr_bits = math.inf
-    min_shift_rbr_bits = math.inf
-    min_whir_bits = mu_batching_bits
-
-    for round_index, round_config in enumerate(params.whir.rounds):
-        for sub_round in range(params.whir.k):
-            fold_bits = -math.log2(whir._epsilon_fold(round_index, sub_round + 1, regime))
-            min_fold_rbr_bits = min(min_fold_rbr_bits, fold_bits)
-            min_whir_bits = min(min_whir_bits, fold_bits)
-
-            rate, dimension = whir._get_code_for_iteration_and_round(round_index, sub_round + 1)
-            proximity_error = regime.get_error_powers(rate, dimension, 2)
-            proximity_bits = -math.log2(proximity_error) + params.whir.folding_pow_bits
-            min_proximity_gaps_bits = min(min_proximity_gaps_bits, proximity_bits)
-
-            sumcheck_bits = _whir_sumcheck_security(
-                challenge_field_bits,
-                sub_round,
-                params.whir.folding_pow_bits,
-            )
-            min_sumcheck_bits = min(min_sumcheck_bits, sumcheck_bits)
-
-        query_bits = (
-            params.whir.proximity.whir_query_security_bits(
-                round_config.num_queries,
-                whir.log_inv_rates[round_index],
-            )
-            + params.whir.query_phase_pow_bits
-        )
-        min_query_bits = min(min_query_bits, query_bits)
-
-        next_list_size = whir._get_list_size_for_iteration_and_round(
-            round_index,
-            params.whir.k,
-            regime,
-        )
-        gamma_batching_bits = _whir_gamma_batching_security(
-            challenge_field_bits,
-            round_config.num_queries + 1,
-            next_list_size,
-        )
-        min_gamma_batching_bits = min(min_gamma_batching_bits, gamma_batching_bits)
-
-        shift_rbr_bits = _combine_security_bits(query_bits, gamma_batching_bits)
-        min_shift_rbr_bits = min(min_shift_rbr_bits, shift_rbr_bits)
-        min_whir_bits = min(min_whir_bits, shift_rbr_bits)
-
-        if round_index < whir.num_iterations - 1:
-            ood_bits = _whir_ood_security(
-                challenge_field_bits,
-                whir.log_degrees[round_index + 1],
-                next_list_size,
-            )
-            min_ood_bits = min(min_ood_bits, ood_bits)
-            min_whir_bits = min(min_whir_bits, ood_bits)
-
+    shared_whir_details = _get_shared_whir_details(whir, regime)
     whir_details = SWIRLWhirDetails(
         mu_batching_bits=mu_batching_bits,
-        fold_rbr_bits=min_fold_rbr_bits,
-        proximity_gaps_bits=min_proximity_gaps_bits,
-        sumcheck_bits=min_sumcheck_bits,
-        ood_rbr_bits=min_ood_bits,
-        shift_rbr_bits=min_shift_rbr_bits,
-        query_bits=min_query_bits,
-        gamma_batching_bits=min_gamma_batching_bits,
+        pre_loop_proximity_gaps_bits=pre_loop_proximity_gaps_bits,
+        shared_whir_bits=shared_whir_details.shared_whir_bits,
+        shared_fold_bits=shared_whir_details.shared_fold_bits,
+        shared_ood_bits=shared_whir_details.shared_ood_bits,
+        shared_shift_bits=shared_whir_details.shared_shift_bits,
+        shared_final_bits=shared_whir_details.shared_final_bits,
     )
+
+    whir_bits = _finite_min([
+        mu_batching_bits,
+        pre_loop_proximity_gaps_bits,
+        shared_whir_details.shared_whir_bits,
+    ])
 
     total_bits = min(
         logup_bits,
@@ -417,7 +376,7 @@ def calculate_swirl_soundness(
         zerocheck_bits,
         constraint_batching_bits,
         stacked_reduction_bits,
-        min_whir_bits,
+        whir_bits,
     )
 
     return SWIRLSoundnessResult(
@@ -427,7 +386,7 @@ def calculate_swirl_soundness(
         zerocheck_sumcheck_bits=zerocheck_bits,
         constraint_batching_bits=constraint_batching_bits,
         stacked_reduction_bits=stacked_reduction_bits,
-        whir_bits=min_whir_bits,
+        whir_bits=whir_bits,
         whir_details=whir_details,
         total_bits=total_bits,
     )

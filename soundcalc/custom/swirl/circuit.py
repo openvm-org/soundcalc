@@ -57,16 +57,19 @@ class SWIRLCircuit(Circuit):
             "constraint_batching": round(result.constraint_batching_bits, 1),
             "stacked_reduction": round(result.stacked_reduction_bits, 1),
             "whir": round(result.whir_bits, 1),
-            "whir.query": round(result.whir_details.query_bits, 1),
-            "whir.proximity_gaps": round(result.whir_details.proximity_gaps_bits, 1),
-            "whir.sumcheck": round(result.whir_details.sumcheck_bits, 1),
-            "whir.fold_rbr": round(result.whir_details.fold_rbr_bits, 1),
-            "whir.ood_rbr": round(result.whir_details.ood_rbr_bits, 1),
-            "whir.gamma_batching": round(result.whir_details.gamma_batching_bits, 1),
-            "whir.shift_rbr": round(result.whir_details.shift_rbr_bits, 1),
             "whir.mu_batching": round(result.whir_details.mu_batching_bits, 1),
+            "whir.proximity_gaps": round(result.whir_details.pre_loop_proximity_gaps_bits, 1),
+            "whir.shared": round(result.whir_details.shared_whir_bits, 1),
             "total": round(result.total_bits, 1),
         }
+        if result.whir_details.shared_fold_bits is not None:
+            levels["whir.shared_fold"] = round(result.whir_details.shared_fold_bits, 1)
+        if result.whir_details.shared_ood_bits is not None:
+            levels["whir.shared_ood"] = round(result.whir_details.shared_ood_bits, 1)
+        if result.whir_details.shared_shift_bits is not None:
+            levels["whir.shared_shift"] = round(result.whir_details.shared_shift_bits, 1)
+        if result.whir_details.shared_final_bits is not None:
+            levels["whir.shared_final"] = round(result.whir_details.shared_final_bits, 1)
         return {"SWIRL": levels}
 
     def get_parameter_summary(self) -> str:
